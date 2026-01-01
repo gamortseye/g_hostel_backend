@@ -3,12 +3,12 @@ import os
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict
 
 import httpx
 import firebase_admin
-from firebase_admin import credentials, firestore
-from fastapi import FastAPI, HTTPException, status
+from firebase_admin import credentials, firestore, auth as admin_auth
+from fastapi import FastAPI, HTTPException, Header, status, Request
 from pydantic import BaseModel, Field
 
 # --------------------------
@@ -18,43 +18,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("paystack-verifier")
 
 # --------------------------
-# Configuration (env variables)
+# Config (env)
 # --------------------------
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 FIREBASE_JSON_STR = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-# optional: set PORT, etc.
 
 if not PAYSTACK_SECRET_KEY:
-    logger.error("PAYSTACK_SECRET_KEY is not set. Exiting.")
-    # we don't raise here so container can still boot during local dev, but endpoints will fail clearly.
+    logger.warning("PAYSTACK_SECRET_KEY not set - endpoint will fail if called.")
 
 # --------------------------
-# Initialize Firebase Admin
+# Firebase init
 # --------------------------
 if not firebase_admin._apps:
     if FIREBASE_JSON_STR:
-        try:
-            cred_info = json.loads(FIREBASE_JSON_STR)
-            cred = credentials.Certificate(cred_info)
-            firebase_admin.initialize_app(cred)
-            logger.info("Firebase initialized from FIREBASE_SERVICE_ACCOUNT_JSON")
-        except Exception as e:
-            logger.exception("Failed to initialize firebase from env JSON: %s", e)
-            raise
+        cred_info = json.loads(FIREBASE_JSON_STR)
+        cred = credentials.Certificate(cred_info)
+        firebase_admin.initialize_app(cred)
+        logger.info("Initialized Firebase from FIREBASE_SERVICE_ACCOUNT_JSON")
+    elif os.path.exists("serviceAccountKey.json"):
+        cred = credentials.Certificate("serviceAccountKey.json")
+        firebase_admin.initialize_app(cred)
+        logger.info("Initialized Firebase from serviceAccountKey.json")
     else:
-        # fallback to local file
-        if os.path.exists("serviceAccountKey.json"):
-            cred = credentials.Certificate("serviceAccountKey.json")
-            firebase_admin.initialize_app(cred)
-            logger.info("Firebase initialized from serviceAccountKey.json")
-        else:
-            logger.warning("No Firebase credentials found. Firestore client may fail.")
+        logger.warning("Firebase credentials not found; Firestore will fail on use.")
 
 db = firestore.client()
 
-# --------------------------
-# FastAPI app
-# --------------------------
 app = FastAPI(title="Paystack Verifier", version="1.0")
 
 # --------------------------
@@ -67,144 +56,136 @@ class PaymentRequest(BaseModel):
     amountGhs: float = Field(..., description="Expected amount in GHS (decimal)")
 
 # --------------------------
-# Helper: convert GHS float -> minor units (pesewas)
+# Helpers
 # --------------------------
 def ghs_to_minor(amount_ghs: float) -> int:
-    # multiply by 100 and round to nearest int
     return int(round(amount_ghs * 100))
 
 # --------------------------
-# Endpoint: health
+# Health
 # --------------------------
-@app.get("/", status_code=200)
+@app.get("/")
 def home():
-    return {"message": "Paystack verification server running"}
+    return {"message": "Paystack-verifier running"}
 
 # --------------------------
-# Endpoint: verify-payment
+# Verify endpoint
 # --------------------------
-@app.post("/verify-payment", status_code=200)
-async def verify_payment(req: PaymentRequest):
-    # Basic server-side checks
+@app.post("/verify-payment")
+async def verify_payment(
+    req: PaymentRequest,
+    authorization: Optional[str] = Header(None),  # expecting "Bearer <idToken>"
+):
+    # 0. Basic checks
     if not PAYSTACK_SECRET_KEY:
-        logger.error("Missing PAYSTACK_SECRET_KEY")
-        raise HTTPException(status_code=500, detail="Server misconfiguration: missing Paystack key")
+        logger.error("PAYSTACK_SECRET_KEY missing on server.")
+        raise HTTPException(status_code=500, detail="Server misconfiguration")
 
-    # idempotency check: if we've already processed this reference, return success
+    # 1. Validate Authorization header (Firebase ID token)
+    if not authorization or not authorization.lower().startswith("bearer "):
+        logger.warning("Missing Authorization: Bearer <idToken>")
+        raise HTTPException(status_code=401, detail="Missing id token")
+
+    id_token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded_token = admin_auth.verify_id_token(id_token)
+        token_uid = decoded_token.get("uid")
+        if token_uid != req.uid:
+            logger.warning("Token UID mismatch: token=%s request=%s", token_uid, req.uid)
+            raise HTTPException(status_code=403, detail="Token UID mismatch")
+    except Exception as e:
+        logger.exception("Failed to verify id token: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid id token")
+
+    # 2. Idempotency: if payments/{reference} exists and success, return success
     payments_col = db.collection("payments")
     payment_doc_ref = payments_col.document(req.reference)
-
     try:
         existing = payment_doc_ref.get()
         if existing.exists:
-            existing_data = existing.to_dict() or {}
-            existing_status = existing_data.get("status")
-            logger.info("Reference %s already exists with status=%s", req.reference, existing_status)
-            if existing_status == "success":
-                # Already processed successfully — return success (idempotent)
-                return {"status": "success", "message": "Reference already verified"}
-            # otherwise: document exists but not successful — fall through and re-verify
-    except Exception as e:
-        logger.exception("Error checking existing payment: %s", e)
-        # continue — we'll try verify, but log.
+            ed = existing.to_dict() or {}
+            if ed.get("status") == "success":
+                logger.info("Reference already processed: %s", req.reference)
+                return {"status": "success", "message": "Reference already processed"}
+    except Exception:
+        logger.exception("Error checking existing payments doc (non-fatal)")
 
-    # 1) Query Paystack verify endpoint
-    paystack_url = f"https://api.paystack.co/transaction/verify/{req.reference}"
+    # 3. Verify with Paystack
+    verify_url = f"https://api.paystack.co/transaction/verify/{req.reference}"
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
-            resp = await client.get(paystack_url, headers=headers)
+            resp = await client.get(verify_url, headers=headers)
         except Exception as e:
-            logger.exception("Error contacting Paystack: %s", e)
+            logger.exception("Failed to contact Paystack: %s", e)
             raise HTTPException(status_code=502, detail="Failed to contact Paystack")
 
     if resp.status_code != 200:
-        logger.error("Paystack responded with non-200 (%d): %s", resp.status_code, resp.text)
+        logger.error("Paystack returned non-200: %s - %s", resp.status_code, resp.text)
         raise HTTPException(status_code=400, detail="Paystack verification failed")
 
-    try:
-        ps = resp.json()
-    except Exception as e:
-        logger.exception("Failed to parse Paystack JSON: %s", e)
-        raise HTTPException(status_code=500, detail="Invalid Paystack response")
-
-    # expected structure: { "status": true, "message": "...", "data": { ... } }
+    ps = resp.json()
     if not ps.get("status"):
-        logger.error("Paystack reported failure: %s", ps)
-        raise HTTPException(status_code=400, detail="Paystack returned failure")
+        logger.error("Paystack status false: %s", ps)
+        raise HTTPException(status_code=400, detail="Paystack reported failure")
 
     data = ps.get("data") or {}
-    tx_status = data.get("status")
-    tx_amount = data.get("amount")  # amount in minor units (pesewas)
-    tx_currency = data.get("currency") or "GHS"
-    tx_reference = data.get("reference")
-
-    # 2) Ensure Paystack transaction is successful
-    if tx_status != "success":
-        logger.warning("Transaction %s status is not success: %s", req.reference, tx_status)
-        # Store the failed attempt for auditability
+    if data.get("status") != "success":
+        # store attempt
         try:
             payment_doc_ref.set({
                 "uid": req.uid,
                 "reference": req.reference,
+                "status": data.get("status"),
                 "paystack_response": ps,
-                "status": tx_status,
                 "createdAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
         except Exception:
-            logger.exception("Failed to record failed transaction")
-        raise HTTPException(status_code=400, detail="Transaction is not successful")
+            logger.exception("Could not write failed payment doc")
+        raise HTTPException(status_code=400, detail="Transaction not successful")
 
-    # 3) Validate amount matches
-    expected_minor = ghs_to_minor(req.amountGhs)
+    tx_amount = data.get("amount")  # minor unit
     if tx_amount is None:
-        logger.error("Paystack did not return amount for ref %s", req.reference)
+        logger.error("Paystack response missing amount for reference %s", req.reference)
         raise HTTPException(status_code=400, detail="Paystack response missing amount")
 
+    expected_minor = ghs_to_minor(req.amountGhs)
     if int(tx_amount) != expected_minor:
-        # amount mismatch: log details and reject
-        logger.error("Amount mismatch for ref %s: expected %d got %d", req.reference, expected_minor, int(tx_amount))
-        # Write attempt
+        logger.error("Amount mismatch: expected %d got %d", expected_minor, int(tx_amount))
         try:
             payment_doc_ref.set({
                 "uid": req.uid,
                 "reference": req.reference,
-                "paystack_response": ps,
                 "status": "amount_mismatch",
                 "expected_amount_minor": expected_minor,
                 "received_amount_minor": int(tx_amount),
+                "paystack_response": ps,
                 "createdAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
         except Exception:
-            logger.exception("Failed to record mismatch transaction")
+            logger.exception("Failed to write mismatch doc")
         raise HTTPException(status_code=400, detail="Payment amount mismatch")
 
-    # 4) Optional: validate currency
-    if tx_currency and tx_currency.upper() != "GHS":
-        logger.warning("Currency mismatch for %s: got %s", req.reference, tx_currency)
-
-    # 5) Idempotent write: create payments/{reference} and update user's subscription
+    # 4. Everything ok -> write payment doc and update user subscription atomically-ish
     try:
-        # Create payment document (id = reference)
         payment_doc_ref.set({
             "uid": req.uid,
             "reference": req.reference,
             "amountGhs": req.amountGhs,
             "amount_minor": int(tx_amount),
-            "currency": tx_currency,
+            "currency": data.get("currency", "GHS"),
             "status": "success",
-            "paystack_response": ps,  # store full response for auditing
+            "paystack_response": ps,
             "createdAt": firestore.SERVER_TIMESTAMP
         }, merge=True)
 
-        # Compute subscription end date
-        now = datetime.utcnow()
+        # compute subscription end date: 1 or 12 months
         months_to_add = 12 if "12" in req.planId else 1
-        # Best-effort end date using timedelta ~= 30*months (simpler than month arithmetic)
+        # Use server timestamp for start and calculate end date on server (approx 30*days)
+        now = datetime.utcnow()
         end_date = now + timedelta(days=30 * months_to_add)
 
-        # Update user subscription
         user_ref = db.collection("users").document(req.uid)
         user_ref.set({
             "subscriptionStatus": "active",
@@ -219,10 +200,9 @@ async def verify_payment(req: PaymentRequest):
             }
         }, merge=True)
 
-        logger.info("Subscription updated for uid=%s ref=%s", req.uid, req.reference)
     except Exception as e:
-        logger.exception("Firestore update failed: %s", e)
-        # Try to store a failure marker in payments doc
+        logger.exception("Failed to write Firestore records: %s", e)
+        # try to mark payment as db_error
         try:
             payment_doc_ref.set({
                 "uid": req.uid,
@@ -233,13 +213,8 @@ async def verify_payment(req: PaymentRequest):
                 "createdAt": firestore.SERVER_TIMESTAMP
             }, merge=True)
         except Exception:
-            logger.exception("Failed to write fallback payment failure doc")
+            logger.exception("Failed to write fallback payment doc")
+        raise HTTPException(status_code=500, detail="Failed to update database")
 
-        raise HTTPException(status_code=500, detail="Failed to record payment or update subscription")
-
+    logger.info("Payment verified and subscription updated: %s", req.reference)
     return {"status": "success", "message": "Payment verified and subscription updated"}
-
-# --------------------------
-# Uvicorn entry hint
-# --------------------------
-# Run with: uvicorn main:app --host 0.0.0.0 --port 8000
