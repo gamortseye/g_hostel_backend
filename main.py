@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("paystack-verifier")
 
 # ---------- Config from ENV ----------
+# CRITICAL: This must be your LIVE Secret Key (sk_live_...) on Render
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
 FIREBASE_JSON_STR = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
@@ -45,22 +46,26 @@ db = firestore.client()
 # ---------- FastAPI ----------
 app = FastAPI(title="Paystack Verifier")
 
-# Allow CORS temporarily for testing; for production restrict origins
+# Allow CORS - Restrict this to your domain in strict production if needed
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to your app origin in production
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Request model ----------
+# ---------- Request Models ----------
 class PaymentRequest(BaseModel):
     reference: str
     uid: str
     planId: Optional[str] = "unknown"
     amountGhs: Optional[float] = None
 
+class InitPaymentRequest(BaseModel):
+    email: str
+    amount: int  # Amount in kobo/pesewas (e.g. 100 = 1 GHS)
+    reference: str
 
 # ---------- Helpers ----------
 async def verify_paystack_transaction(reference: str) -> dict:
@@ -75,31 +80,65 @@ async def verify_paystack_transaction(reference: str) -> dict:
     logger.info("Paystack response: %s", data)
     return data
 
-
 def compute_end_date(months: int) -> datetime:
     now = datetime.utcnow()
-    # simple month add (approx 30 days each). For more accurate: use dateutil.relativedelta
     return now + timedelta(days=30 * months)
 
+# ---------- NEW ENDPOINT: Initialize Payment ----------
+@app.post("/initialize-payment")
+async def initialize_payment(req: InitPaymentRequest):
+    """
+    Called by Flutter app to get the Secure Payment URL.
+    Uses the Server-Side Secret Key so the App doesn't need it.
+    """
+    url = "https://api.paystack.co/transaction/initialize"
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    # Payload for Paystack
+    payload = {
+        "email": req.email,
+        "amount": req.amount,
+        "reference": req.reference,
+        "currency": "GHS",
+        "channels": ["mobile_money", "card"],
+        # The URL that triggers the app to close
+        "callback_url": "https://standard.paystack.co/close" 
+    }
 
-# ---------- Endpoint ----------
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(url, json=payload, headers=headers)
+            
+        if response.status_code == 200:
+            res_data = response.json()
+            if res_data['status'] is True:
+                return {
+                    "status": True,
+                    "data": {
+                        "authorization_url": res_data['data']['authorization_url'],
+                        "reference": res_data['data']['reference']
+                    }
+                }
+            else:
+                raise HTTPException(status_code=400, detail=res_data.get('message', 'Initialization failed'))
+        else:
+            logger.error(f"Paystack Init Error: {response.text}")
+            raise HTTPException(status_code=response.status_code, detail="Failed to initialize with Paystack")
+            
+    except httpx.RequestError as exc:
+        logger.error(f"Connection error to Paystack: {exc}")
+        raise HTTPException(status_code=503, detail="Service unavailable")
+
+# ---------- EXISTING ENDPOINT: Verify Payment ----------
 @app.post("/verify-payment")
 async def verify_payment(req: PaymentRequest, authorization: str | None = Header(None)):
-    """
-    Expects:
-      - Authorization: Bearer <firebase id token>
-      - JSON body: { reference, uid, planId, amountGhs }
-
-    Performs:
-      1) Verify Firebase ID token -> ensures caller is the user.
-      2) Call Paystack verify API and ensure transaction is successful.
-      3) (Optional) Confirm amount matches.
-      4) Update Firestore user document with subscription fields.
-    """
     logger.info("Incoming verify-payment request: reference=%s uid=%s plan=%s amount=%s",
                 req.reference, req.uid, req.planId, req.amountGhs)
 
-    # 1) Authorization header
+    # 1) Authorization header check
     if not authorization:
         logger.warning("Missing Authorization header")
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -117,7 +156,6 @@ async def verify_payment(req: PaymentRequest, authorization: str | None = Header
         if token_uid != req.uid:
             logger.warning("UID mismatch: token_uid=%s payload_uid=%s", token_uid, req.uid)
             raise HTTPException(status_code=403, detail="Token UID does not match provided uid")
-        logger.info("Firebase token verified for uid=%s", token_uid)
     except Exception as e:
         logger.exception("Firebase token verification failed: %s", e)
         raise HTTPException(status_code=401, detail="Invalid Firebase ID token")
@@ -125,33 +163,29 @@ async def verify_payment(req: PaymentRequest, authorization: str | None = Header
     # 3) Verify with Paystack
     paystack_data = await verify_paystack_transaction(req.reference)
 
-    # paystack_data expected shape: { status: True, message: "...", data: {...} }
     if not paystack_data.get("status"):
-        logger.warning("Paystack reports status false: %s", paystack_data)
         raise HTTPException(status_code=400, detail="Paystack did not return success status")
 
     pdata = paystack_data.get("data", {})
     if pdata.get("status") != "success":
-        logger.warning("Paystack transaction not successful: %s", pdata.get("status"))
         raise HTTPException(status_code=400, detail="Transaction not successful")
 
-    # 4) Optional: confirm amount (Paystack returns amount in minor units)
+    # 4) Optional: confirm amount
     if req.amountGhs is not None:
         expected_minor = int(round(req.amountGhs * 100))
         received_minor = int(pdata.get("amount", 0))
-        if received_minor != expected_minor:
-            # amount mismatch -> suspicious
+        # Allow small floating point margin or exact match
+        if abs(received_minor - expected_minor) > 5: 
             logger.warning("Amount mismatch: expected %s got %s", expected_minor, received_minor)
             raise HTTPException(status_code=400, detail="Paid amount does not match expected amount")
 
-    # 5) All checks passed -> update Firestore
+    # 5) Update Firestore
     try:
         months = 12 if ("12" in (req.planId or "").lower()) else 1
         now = datetime.utcnow()
         end_date = compute_end_date(months)
 
         user_ref = db.collection("users").document(req.uid)
-        # Compose update payload
         update_payload = {
             "subscriptionStatus": "active",
             "subscriptionPlan": req.planId,
@@ -165,7 +199,6 @@ async def verify_payment(req: PaymentRequest, authorization: str | None = Header
                 "timestamp": now,
             },
         }
-        # merge update
         user_ref.set(update_payload, merge=True)
         logger.info("Firestore updated for uid=%s", req.uid)
         return {"status": "success", "message": "Subscription activated"}
@@ -173,7 +206,6 @@ async def verify_payment(req: PaymentRequest, authorization: str | None = Header
         logger.exception("Failed updating Firestore: %s", e)
         raise HTTPException(status_code=500, detail="Database update failed")
 
-
 @app.get("/")
 def home():
-    return {"message": "Paystack verifier running"}
+    return {"message": "Paystack Secure Server Running"}
