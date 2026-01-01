@@ -1,4 +1,4 @@
-# main.py
+# server.py
 import os
 import json
 import logging
@@ -7,174 +7,173 @@ from typing import Optional
 
 import httpx
 import firebase_admin
-from firebase_admin import credentials, firestore, auth as firebase_auth
+from firebase_admin import credentials, auth as fb_auth, firestore
 from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# Configure logging (Render logs will show this)
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("pay-verify")
+logger = logging.getLogger("paystack-verifier")
 
-# --- CONFIG ---
+# ---------- Config from ENV ----------
 PAYSTACK_SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY")
-FIREBASE_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
-# Optionally allow a debug bypass token (not for prod)
-DEBUG_ALLOW_NO_IDTOKEN = os.environ.get("DEBUG_ALLOW_NO_IDTOKEN", "false").lower() == "true"
+FIREBASE_JSON_STR = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 if not PAYSTACK_SECRET_KEY:
-    logger.error("PAYSTACK_SECRET_KEY not set in environment")
-if not FIREBASE_JSON:
-    logger.error("FIREBASE_SERVICE_ACCOUNT_JSON not set in environment")
+    logger.error("PAYSTACK_SECRET_KEY is not set in environment")
+if not FIREBASE_JSON_STR:
+    logger.error("FIREBASE_SERVICE_ACCOUNT_JSON is not set in environment")
 
-# --- FIREBASE init ---
+# ---------- Initialize Firebase Admin ----------
 if not firebase_admin._apps:
-    if FIREBASE_JSON:
-        try:
-            cred_info = json.loads(FIREBASE_JSON)
-            cred = credentials.Certificate(cred_info)
-            firebase_admin.initialize_app(cred)
-            logger.info("Initialized Firebase Admin from ENV JSON")
-        except Exception as e:
-            logger.exception("Failed to initialize Firebase Admin from ENV JSON: %s", e)
-            raise
+    if FIREBASE_JSON_STR:
+        cred_info = json.loads(FIREBASE_JSON_STR)
+        cred = credentials.Certificate(cred_info)
+        firebase_admin.initialize_app(cred)
+        logger.info("Firebase Admin initialized from ENV JSON.")
+    elif os.path.exists("serviceAccountKey.json"):
+        cred = credentials.Certificate("serviceAccountKey.json")
+        firebase_admin.initialize_app(cred)
+        logger.info("Firebase Admin initialized from local file.")
     else:
-        # try fallback to local file (dev only)
-        if os.path.exists("serviceAccountKey.json"):
-            cred = credentials.Certificate("serviceAccountKey.json")
-            firebase_admin.initialize_app(cred)
-            logger.info("Initialized Firebase Admin from local serviceAccountKey.json")
-        else:
-            logger.error("No Firebase credentials found. Exiting.")
-            raise RuntimeError("FIREBASE service account JSON is required")
+        logger.error("No Firebase credentials found. Exiting.")
+        raise RuntimeError("No Firebase credentials available.")
 
 db = firestore.client()
-app = FastAPI()
 
-# Request model
+# ---------- FastAPI ----------
+app = FastAPI(title="Paystack Verifier")
+
+# Allow CORS temporarily for testing; for production restrict origins
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # change to your app origin in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Request model ----------
 class PaymentRequest(BaseModel):
     reference: str
     uid: str
-    planId: str
-    amountGhs: float
+    planId: Optional[str] = "unknown"
+    amountGhs: Optional[float] = None
 
-# Helper: verify firebase id token and return uid/email
-async def verify_id_token(id_token: Optional[str]) -> dict:
-    if not id_token:
-        if DEBUG_ALLOW_NO_IDTOKEN:
-            logger.warning("No id token provided but DEBUG_ALLOW_NO_IDTOKEN=true, continuing without user verification")
-            return {}
-        raise HTTPException(status_code=401, detail="Missing Authorization ID token")
-    try:
-        decoded = firebase_auth.verify_id_token(id_token)
-        return decoded
-    except Exception as e:
-        logger.exception("Invalid ID token: %s", e)
-        raise HTTPException(status_code=401, detail="Invalid ID token")
 
-@app.post("/verify-payment")
-async def verify_payment(payload: PaymentRequest, authorization: Optional[str] = Header(None)):
-    """
-    Verifies a Paystack transaction reference, ensures it's successful and matches expected amount & currency,
-    then updates the user's Firestore document with subscription fields.
-    """
-    logger.info("Incoming verify-payment request: reference=%s uid=%s planId=%s amountGhs=%s", payload.reference, payload.uid, payload.planId, payload.amountGhs)
-
-    # extract bearer token if present
-    id_token = None
-    if authorization:
-        parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            id_token = parts[1]
-
-    # verify id token (optional dev bypass)
-    decoded = await verify_id_token(id_token) if not DEBUG_ALLOW_NO_IDTOKEN else (firebase_auth.verify_id_token(id_token) if id_token else {})
-    if decoded:
-        # ensure token uid matches provided uid
-        token_uid = decoded.get("uid")
-        if token_uid and token_uid != payload.uid:
-            logger.warning("Token UID (%s) does not match provided uid (%s)", token_uid, payload.uid)
-            raise HTTPException(status_code=403, detail="Token does not match uid")
-
-    # 1) call Paystack verify endpoint
-    verify_url = f"https://api.paystack.co/transaction/verify/{payload.reference}"
+# ---------- Helpers ----------
+async def verify_paystack_transaction(reference: str) -> dict:
+    url = f"https://api.paystack.co/transaction/verify/{reference}"
     headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
-    logger.info("Calling Paystack verify: %s", verify_url)
-
     async with httpx.AsyncClient(timeout=20.0) as client:
-        try:
-            resp = await client.get(verify_url, headers=headers)
-        except Exception as e:
-            logger.exception("HTTP error calling Paystack: %s", e)
-            raise HTTPException(status_code=502, detail="Failed to reach Paystack")
+        r = await client.get(url, headers=headers)
+    if r.status_code != 200:
+        logger.warning("Paystack verify returned non-200: %s %s", r.status_code, r.text)
+        raise HTTPException(status_code=502, detail="Failed to contact Paystack")
+    data = r.json()
+    logger.info("Paystack response: %s", data)
+    return data
 
-    if resp.status_code != 200:
-        logger.error("Paystack verify returned non-200: %s %s", resp.status_code, resp.text)
-        raise HTTPException(status_code=502, detail=f"Paystack verify failed: {resp.status_code}")
 
-    data = resp.json()
-    logger.info("Paystack response: %s", json.dumps(data))
+def compute_end_date(months: int) -> datetime:
+    now = datetime.utcnow()
+    # simple month add (approx 30 days each). For more accurate: use dateutil.relativedelta
+    return now + timedelta(days=30 * months)
 
-    # Paystack returns top-level 'status' boolean and a 'data' dict
-    if not data.get("status") or not data.get("data"):
-        logger.error("Unexpected Paystack response shape")
-        raise HTTPException(status_code=400, detail="Invalid Paystack response")
 
-    tx = data["data"]
-    tx_status = tx.get("status")
-    tx_currency = tx.get("currency")
-    tx_amount = tx.get("amount")  # amount is in minor unit (pesewas)
-    tx_reference = tx.get("reference")
+# ---------- Endpoint ----------
+@app.post("/verify-payment")
+async def verify_payment(req: PaymentRequest, authorization: str | None = Header(None)):
+    """
+    Expects:
+      - Authorization: Bearer <firebase id token>
+      - JSON body: { reference, uid, planId, amountGhs }
 
-    if tx_status != "success":
-        logger.warning("Transaction not successful according to Paystack: %s", tx_status)
+    Performs:
+      1) Verify Firebase ID token -> ensures caller is the user.
+      2) Call Paystack verify API and ensure transaction is successful.
+      3) (Optional) Confirm amount matches.
+      4) Update Firestore user document with subscription fields.
+    """
+    logger.info("Incoming verify-payment request: reference=%s uid=%s plan=%s amount=%s",
+                req.reference, req.uid, req.planId, req.amountGhs)
+
+    # 1) Authorization header
+    if not authorization:
+        logger.warning("Missing Authorization header")
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    if not authorization.lower().startswith("bearer "):
+        logger.warning("Malformed Authorization header")
+        raise HTTPException(status_code=401, detail="Invalid Authorization header")
+
+    id_token = authorization.split(" ", 1)[1].strip()
+
+    # 2) Verify Firebase ID token
+    try:
+        decoded = fb_auth.verify_id_token(id_token)
+        token_uid = decoded.get("uid")
+        if token_uid != req.uid:
+            logger.warning("UID mismatch: token_uid=%s payload_uid=%s", token_uid, req.uid)
+            raise HTTPException(status_code=403, detail="Token UID does not match provided uid")
+        logger.info("Firebase token verified for uid=%s", token_uid)
+    except Exception as e:
+        logger.exception("Firebase token verification failed: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid Firebase ID token")
+
+    # 3) Verify with Paystack
+    paystack_data = await verify_paystack_transaction(req.reference)
+
+    # paystack_data expected shape: { status: True, message: "...", data: {...} }
+    if not paystack_data.get("status"):
+        logger.warning("Paystack reports status false: %s", paystack_data)
+        raise HTTPException(status_code=400, detail="Paystack did not return success status")
+
+    pdata = paystack_data.get("data", {})
+    if pdata.get("status") != "success":
+        logger.warning("Paystack transaction not successful: %s", pdata.get("status"))
         raise HTTPException(status_code=400, detail="Transaction not successful")
 
-    # Validate reference matches (trust Paystack's returned reference)
-    # Ensure the amount matches expected (compare integers in minor unit)
-    expected_minor = int(round(payload.amountGhs * 100))
-    tx_amount_int = int(tx_amount) if tx_amount is not None else None
+    # 4) Optional: confirm amount (Paystack returns amount in minor units)
+    if req.amountGhs is not None:
+        expected_minor = int(round(req.amountGhs * 100))
+        received_minor = int(pdata.get("amount", 0))
+        if received_minor != expected_minor:
+            # amount mismatch -> suspicious
+            logger.warning("Amount mismatch: expected %s got %s", expected_minor, received_minor)
+            raise HTTPException(status_code=400, detail="Paid amount does not match expected amount")
 
-    # Some Paystack integrations may produce amounts scaled differently; log both and continue only if matching
-    if tx_amount_int is None:
-        logger.warning("Paystack returned no amount field")
-    else:
-        logger.info("Comparing amounts: expected=%s got=%s (both minor units)", expected_minor, tx_amount_int)
-        if tx_amount_int != expected_minor:
-            logger.warning("Amount mismatch! expected %s but Paystack returned %s", expected_minor, tx_amount_int)
-            # _not_ failing — depending on policy you may FAIL here. For safety, fail:
-            raise HTTPException(status_code=400, detail="Amount mismatch with Paystack transaction")
-
-    if tx_currency and tx_currency.upper() != "GHS":
-        logger.warning("Currency mismatch: %s", tx_currency)
-        raise HTTPException(status_code=400, detail="Currency mismatch")
-
-    # 2) Update Firestore
+    # 5) All checks passed -> update Firestore
     try:
+        months = 12 if ("12" in (req.planId or "").lower()) else 1
         now = datetime.utcnow()
-        months_to_add = 12 if "12" in payload.planId else 1
-        # best-effort end date: add months (approx 30 days per month)
-        end_date = now + timedelta(days=30 * months_to_add)
+        end_date = compute_end_date(months)
 
-        user_ref = db.collection("users").document(payload.uid)
-        user_ref.set({
+        user_ref = db.collection("users").document(req.uid)
+        # Compose update payload
+        update_payload = {
             "subscriptionStatus": "active",
-            "subscriptionPlan": payload.planId,
+            "subscriptionPlan": req.planId,
             "subscriptionStart": now,
             "subscriptionEnd": end_date,
             "lastPayment": {
-                "amount": float(payload.amountGhs),
-                "currency": "GHS",
-                "reference": payload.reference,
-                "verified_at": now
-            }
-        }, merge=True)
-
-        logger.info("Firestore updated for uid=%s", payload.uid)
+                "amount": float(req.amountGhs or (pdata.get("amount", 0) / 100.0)),
+                "currency": pdata.get("currency", "GHS"),
+                "reference": req.reference,
+                "paystack_data": pdata,
+                "timestamp": now,
+            },
+        }
+        # merge update
+        user_ref.set(update_payload, merge=True)
+        logger.info("Firestore updated for uid=%s", req.uid)
         return {"status": "success", "message": "Subscription activated"}
     except Exception as e:
-        logger.exception("Failed to update Firestore: %s", e)
+        logger.exception("Failed updating Firestore: %s", e)
         raise HTTPException(status_code=500, detail="Database update failed")
+
 
 @app.get("/")
 def home():
-    return {"message": "Payment Server is Running"}
+    return {"message": "Paystack verifier running"}
